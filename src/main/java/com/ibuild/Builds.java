@@ -1,13 +1,9 @@
 package com.ibuild;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.mojang.logging.LogUtils;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.loader.api.FabricLoader;
-import net.minecraft.commands.arguments.blocks.BlockStateParser;
 import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.core.HolderLookup;
@@ -21,34 +17,70 @@ import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Rotation;
 import net.minecraft.world.level.block.state.BlockState;
+import org.slf4j.Logger;
 
 import java.io.IOException;
-import java.io.Reader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public final class Builds {
+    private static final Logger LOGGER = LogUtils.getLogger();
+
     static final Path DIR = FabricLoader.getInstance().getGameDir().resolve("ibuilds");
-    static final int MAX_BLOCKS = Integer.MAX_VALUE;
-    static final int MAX_COORD = 30_000;
+    /** Au-dessus de ce nombre de blocs, le build passe en mode optimise (voir BigBuild). */
+    static final int BIG_THRESHOLD = 100_000;
     static final int PER_TICK = 1000;
 
-    private static final Map<String, JsonObject> FILES = new TreeMap<>();
+    /** Fichiers valides : nom -> chemin. Les arbres JSON ne sont PAS gardes en memoire. */
+    private static final Map<String, Path> FILES = new TreeMap<>();
+    private record Checked(long size, long mtime, String error) {}
+    private static final Map<Path, Checked> CHECKED = new HashMap<>();
     private static final List<String> ERRORS = new ArrayList<>();
+
     private static final Map<UUID, String> SELECTED = new HashMap<>();
-    private static final Map<UUID, Job> JOBS = new HashMap<>();
+    private static final Map<UUID, Task> JOBS = new HashMap<>();
+    private static final Set<UUID> PENDING = new HashSet<>();
     private static final Map<UUID, List<Entry>> UNDO = new HashMap<>();
+    private static final Map<UUID, BigBuild.Undo> BIG_UNDO = new HashMap<>();
+
+    /** Lecture / preparation des gros builds hors du thread serveur. */
+    private static final ExecutorService PLANNER = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "ibuild-planner");
+        t.setDaemon(true);
+        return t;
+    });
 
     record Entry(BlockPos pos, BlockState state) {}
+
+    /** Travail execute un peu a chaque tick serveur. */
+    interface Task {
+        /** Renvoie vrai quand le travail est termine. */
+        boolean step();
+        UUID owner();
+    }
 
     private Builds() {}
 
     static void init() {
         try { Files.createDirectories(DIR); } catch (IOException ignored) {}
         reload();
-        ServerTickEvents.END_SERVER_TICK.register(server -> JOBS.values().removeIf(Job::step));
-        ServerLifecycleEvents.SERVER_STOPPED.register(server -> { JOBS.clear(); UNDO.clear(); });
+        ServerTickEvents.END_SERVER_TICK.register(server -> JOBS.values().removeIf(job -> {
+            try {
+                return job.step();
+            } catch (Throwable t) {
+                // Une erreur ne doit jamais faire tomber le serveur : on arrete juste ce build.
+                LOGGER.error("[ibuild] erreur pendant un build", t);
+                ServerPlayer p = server.getPlayerList().getPlayer(job.owner());
+                if (p != null) p.sendSystemMessage(IBuildMod.txt("[ibuild] Build interrompu : " + t));
+                return true;
+            }
+        }));
+        ServerLifecycleEvents.SERVER_STOPPED.register(server -> {
+            JOBS.clear(); UNDO.clear(); BIG_UNDO.clear(); PENDING.clear();
+        });
     }
 
     // ---------- chargement des fichiers ----------
@@ -61,12 +93,21 @@ public final class Builds {
             for (Path p : files) {
                 String fn = p.getFileName().toString();
                 String name = fn.substring(0, fn.length() - 5);
-                try (Reader r = Files.newBufferedReader(p)) {
-                    FILES.put(name, JsonParser.parseReader(r).getAsJsonObject());
-                } catch (Exception e) {
+                try {
+                    long size = Files.size(p), mtime = Files.getLastModifiedTime(p).toMillis();
+                    Checked c = CHECKED.get(p);
+                    if (c == null || c.size() != size || c.mtime() != mtime) {
+                        // Verification de syntaxe en streaming, refaite seulement si le fichier a change.
+                        c = new Checked(size, mtime, Ops.validate(p));
+                        CHECKED.put(p, c);
+                    }
+                    if (c.error() == null) FILES.put(name, p);
+                    else ERRORS.add(name + " : " + c.error());
+                } catch (IOException e) {
                     ERRORS.add(name + " : " + e.getMessage());
                 }
             }
+            CHECKED.keySet().retainAll(new HashSet<>(files));
         } catch (IOException e) {
             ERRORS.add("Dossier illisible : " + e.getMessage());
         }
@@ -127,37 +168,112 @@ public final class Builds {
 
     // ---------- placement ----------
 
+    /** Resultat de la preparation (thread annexe). */
+    private record Prep(Ops ops, int cx, int cz, long estimate, BigBuild big) {}
+
     static void place(ServerLevel level, ServerPlayer p, BlockPos base) {
         UUID id = p.getUUID();
         String name = selected(id);
         if (name == null) { p.sendSystemMessage(IBuildMod.txt("[ibuild] Aucun build. Dossier : " + DIR)); return; }
-        if (JOBS.containsKey(id)) { p.sendSystemMessage(IBuildMod.txt("[ibuild] Un build est deja en cours (/ibuild undo pour annuler).")); return; }
-
-        Map<Long, BlockState> cells;
-        try {
-            cells = parse(FILES.get(name), level.registryAccess().lookupOrThrow(Registries.BLOCK));
-        } catch (Exception e) {
-            p.sendSystemMessage(IBuildMod.txt("[ibuild] JSON invalide (" + name + ") : " + e.getMessage()));
+        if (JOBS.containsKey(id) || PENDING.contains(id)) {
+            p.sendSystemMessage(IBuildMod.txt("[ibuild] Un build est deja en cours (/ibuild undo pour annuler)."));
             return;
         }
-        if (cells.isEmpty()) { p.sendSystemMessage(IBuildMod.txt("[ibuild] Build vide.")); return; }
 
-        int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE, minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
-        for (long k : cells.keySet()) {
-            BlockPos lp = BlockPos.of(k);
-            minX = Math.min(minX, lp.getX()); maxX = Math.max(maxX, lp.getX());
-            minZ = Math.min(minZ, lp.getZ()); maxZ = Math.max(maxZ, lp.getZ());
-        }
-        int cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
+        // Tout ce qui touche au monde / au joueur est lu ICI, sur le thread serveur.
+        Path file = FILES.get(name);
+        HolderLookup<Block> lookup = level.registryAccess().lookupOrThrow(Registries.BLOCK);
+        Rotation rot = rotationFor(p.getDirection());
+        int minY = minY(level), maxY = maxY(level);
+        var server = level.getServer();
 
-        // La facade du build (cote +z / sud) est tournee vers le joueur.
-        Direction d = p.getDirection();
-        Rotation rot = switch (d) {
+        PENDING.add(id);
+        PLANNER.execute(() -> {
+            Prep prep = null;
+            Throwable err = null;
+            try {
+                prep = prepare(file, lookup, rot, base, minY, maxY);
+            } catch (OutOfMemoryError e) {
+                err = new RuntimeException("memoire insuffisante (augmente -Xmx dans le lanceur)");
+            } catch (Throwable e) {
+                err = e;
+            }
+            Prep fp = prep;
+            Throwable fe = err;
+            server.execute(() -> finishPlace(level, id, name, base, rot, fp, fe));
+        });
+    }
+
+    /** La facade du build (cote +z / sud) est tournee vers le joueur. */
+    private static Rotation rotationFor(Direction d) {
+        return switch (d) {
             case NORTH -> Rotation.NONE;
             case EAST -> Rotation.CLOCKWISE_90;
             case SOUTH -> Rotation.CLOCKWISE_180;
             default -> Rotation.COUNTERCLOCKWISE_90;
         };
+    }
+
+    /** Thread annexe : lit le fichier en streaming, decide du mode, prepare le plan optimise. Aucun acces au monde. */
+    private static Prep prepare(Path file, HolderLookup<Block> lookup, Rotation rot, BlockPos base, int minY, int maxY) throws IOException {
+        Ops ops = Ops.read(file, lookup);
+        if (ops.n == 0) return new Prep(ops, 0, 0, 0, null);
+
+        int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE, minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
+        int lowY = Integer.MAX_VALUE, highY = Integer.MIN_VALUE;
+        for (int i = 0; i < ops.n; i++) {
+            int o = i * Ops.STRIDE;
+            minX = Math.min(minX, ops.d[o]);     maxX = Math.max(maxX, ops.d[o + 3]);
+            lowY = Math.min(lowY, ops.d[o + 1]); highY = Math.max(highY, ops.d[o + 4]);
+            minZ = Math.min(minZ, ops.d[o + 2]); maxZ = Math.max(maxZ, ops.d[o + 5]);
+        }
+        int cx = (minX + maxX) / 2, cz = (minZ + maxZ) / 2;
+        long est = ops.count();
+
+        // Le mode classique empaquette les positions dans un long (y sur 12 bits) : hors de cette plage -> mode optimise.
+        boolean big = est > BIG_THRESHOLD || lowY < -2048 || highY > 2047;
+        BigBuild plan = big ? BigBuild.plan(ops, rot, cx, cz, base, minY, maxY, est) : null;
+        return new Prep(ops, cx, cz, est, plan);
+    }
+
+    /** Thread serveur : demarre le travail. */
+    private static void finishPlace(ServerLevel level, UUID id, String name, BlockPos base, Rotation rot, Prep prep, Throwable err) {
+        PENDING.remove(id);
+        ServerPlayer p = level.getServer().getPlayerList().getPlayer(id);
+        if (p == null) return;
+        if (err != null) {
+            p.sendSystemMessage(IBuildMod.txt("[ibuild] JSON invalide (" + name + ") : " + err.getMessage()));
+            return;
+        }
+        if (prep.ops().n == 0) { p.sendSystemMessage(IBuildMod.txt("[ibuild] Build vide.")); return; }
+        if (JOBS.containsKey(id)) { p.sendSystemMessage(IBuildMod.txt("[ibuild] Un build est deja en cours (/ibuild undo pour annuler).")); return; }
+
+        UNDO.remove(id);
+        BIG_UNDO.remove(id);
+        if (prep.big() != null) startBig(level, p, name, base, prep);
+        else startClassic(level, p, name, base, rot, prep);
+        level.sendParticles(ParticleTypes.ENCHANT, base.getX() + .5, base.getY() + 1.0, base.getZ() + .5, 60, 1.5, 1.0, 1.5, 0.5);
+        level.playSound(null, base, SoundEvents.BEACON_POWER_SELECT, SoundSource.PLAYERS, 1.0f, 1.2f);
+    }
+
+    // ---------- mode optimise (> BIG_THRESHOLD blocs) ----------
+
+    private static void startBig(ServerLevel level, ServerPlayer p, String name, BlockPos base, Prep prep) {
+        UUID id = p.getUUID();
+        BigBuild big = prep.big();
+        BigBuild.Undo undo = new BigBuild.Undo(big.minY, big.maxY);
+        BIG_UNDO.put(id, undo);
+        JOBS.put(id, new BigBuild.Job(level, id, name, big, undo));
+        p.sendSystemMessage(IBuildMod.txt("[ibuild] Construction de \"" + name + "\" en mode optimise : jusqu'a "
+                + prep.estimate() + " blocs, " + big.order.length + " colonnes de chunks (progression dans la barre d'action)..."));
+    }
+
+    // ---------- mode classique (<= BIG_THRESHOLD blocs) ----------
+
+    private static void startClassic(ServerLevel level, ServerPlayer p, String name, BlockPos base, Rotation rot, Prep prep) {
+        UUID id = p.getUUID();
+        Map<Long, BlockState> cells = expand(prep.ops());
+        int cx = prep.cx(), cz = prep.cz();
 
         List<Entry> toPlace = new ArrayList<>();
         List<Entry> undo = new ArrayList<>();
@@ -183,22 +299,27 @@ public final class Builds {
         UNDO.put(id, undo);
         JOBS.put(id, new Job(level, id, name, toPlace, false));
         p.sendSystemMessage(IBuildMod.txt("[ibuild] Construction de \"" + name + "\" : " + toPlace.size() + " blocs..."));
-        level.sendParticles(ParticleTypes.ENCHANT, base.getX() + .5, base.getY() + 1.0, base.getZ() + .5, 60, 1.5, 1.0, 1.5, 0.5);
-        level.playSound(null, base, SoundEvents.BEACON_POWER_SELECT, SoundSource.PLAYERS, 1.0f, 1.2f);
     }
 
     static void undo(ServerPlayer p) {
         UUID id = p.getUUID();
+        BigBuild.Undo big = BIG_UNDO.remove(id);
         List<Entry> u = UNDO.remove(id);
-        if (u == null) { p.sendSystemMessage(IBuildMod.txt("[ibuild] Rien a annuler.")); return; }
+        if (big == null && u == null) { p.sendSystemMessage(IBuildMod.txt("[ibuild] Rien a annuler.")); return; }
         JOBS.remove(id);
-        List<Entry> list = new ArrayList<>(u);
-        list.sort(Comparator.comparingInt((Entry en) -> en.pos().getY()).reversed());
-        JOBS.put(id, new Job((ServerLevel) p.level(), id, "undo", list, true));
-        p.sendSystemMessage(IBuildMod.txt("[ibuild] Annulation de " + list.size() + " blocs..."));
+        ServerLevel level = (ServerLevel) p.level();
+        if (big != null) {
+            JOBS.put(id, new BigBuild.UndoJob(level, id, big));
+            p.sendSystemMessage(IBuildMod.txt("[ibuild] Annulation en cours (mode optimise)..."));
+        } else {
+            List<Entry> list = new ArrayList<>(u);
+            list.sort(Comparator.comparingInt((Entry en) -> en.pos().getY()).reversed());
+            JOBS.put(id, new Job(level, id, "undo", list, true));
+            p.sendSystemMessage(IBuildMod.txt("[ibuild] Annulation de " + list.size() + " blocs..."));
+        }
     }
 
-    private static int[] rotate(Rotation r, int x, int z) {
+    static int[] rotate(Rotation r, int x, int z) {
         return switch (r) {
             case NONE -> new int[]{x, z};
             case CLOCKWISE_90 -> new int[]{-z, x};
@@ -207,64 +328,62 @@ public final class Builds {
         };
     }
 
-    // ---------- parsing du JSON ----------
+    // ---------- hauteur du monde (sans dependre d'un nom d'API) ----------
 
-    static Map<Long, BlockState> parse(JsonObject root, HolderLookup<Block> lookup) throws Exception {
-        JsonArray ops = root.getAsJsonArray("ops");
-        if (ops == null) throw new IllegalArgumentException("champ \"ops\" manquant");
+    private static int minY(ServerLevel l) {
+        int lo = -(1 << 16), hi = 0; // lo : hors du monde, hi : dans le monde
+        while (hi - lo > 1) {
+            int mid = (lo + hi) >> 1;
+            if (l.isOutsideBuildHeight(new BlockPos(0, mid, 0))) lo = mid; else hi = mid;
+        }
+        return hi;
+    }
+
+    private static int maxY(ServerLevel l) {
+        int lo = 0, hi = 1 << 16; // lo : dans le monde, hi : hors du monde
+        while (hi - lo > 1) {
+            int mid = (lo + hi) >> 1;
+            if (l.isOutsideBuildHeight(new BlockPos(0, mid, 0))) hi = mid; else lo = mid;
+        }
+        return lo;
+    }
+
+    // ---------- expansion du mode classique ----------
+
+    /** Memes cellules et meme ordre d'insertion qu'avant (le dernier ecrase les precedents). */
+    private static Map<Long, BlockState> expand(Ops ops) {
         Map<Long, BlockState> out = new LinkedHashMap<>();
-        int idx = 0;
-        for (JsonElement el : ops) {
-            idx++;
-            JsonObject o = el.getAsJsonObject();
-            String type = o.get("type").getAsString();
-            BlockState st = BlockStateParser.parseForBlock(lookup, o.get("block").getAsString(), false).blockState();
-            switch (type) {
-                case "set" -> {
-                    int[] a = vec(o.getAsJsonArray("pos"), idx);
-                    out.put(new BlockPos(a[0], a[1], a[2]).asLong(), st);
+        for (int i = 0; i < ops.n; i++) {
+            int o = i * Ops.STRIDE;
+            int meta = ops.d[o + 6];
+            BlockState st = ops.palette.get(meta & 0xFFFFFF);
+            int mode = meta >>> 24;
+            int x0 = ops.d[o], y0 = ops.d[o + 1], z0 = ops.d[o + 2], x1 = ops.d[o + 3], y1 = ops.d[o + 4], z1 = ops.d[o + 5];
+            long vol = (long) (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1);
+            if (vol <= 2_000_000) {
+                for (int x = x0; x <= x1; x++) for (int y = y0; y <= y1; y++) for (int z = z0; z <= z1; z++) {
+                    boolean ex = x == x0 || x == x1, ey = y == y0 || y == y1, ez = z == z0 || z == z1;
+                    boolean ok = switch (mode) {
+                        case Ops.SOLID -> true;
+                        case Ops.HOLLOW -> ex || ey || ez;
+                        case Ops.WALLS -> ex || ez;
+                        default -> (ex ? 1 : 0) + (ey ? 1 : 0) + (ez ? 1 : 0) >= 2;
+                    };
+                    if (ok) out.put(new BlockPos(x, y, z).asLong(), st);
                 }
-                case "fill" -> {
-                    int[] a = vec(o.getAsJsonArray("from"), idx);
-                    int[] b = vec(o.getAsJsonArray("to"), idx);
-                    String mode = o.has("mode") ? o.get("mode").getAsString() : "solid";
-                    int x0 = Math.min(a[0], b[0]), x1 = Math.max(a[0], b[0]);
-                    int y0 = Math.min(a[1], b[1]), y1 = Math.max(a[1], b[1]);
-                    int z0 = Math.min(a[2], b[2]), z1 = Math.max(a[2], b[2]);
-                    long vol = (long) (x1 - x0 + 1) * (y1 - y0 + 1) * (z1 - z0 + 1);
-                    if (vol > MAX_BLOCKS) throw new IllegalArgumentException("op " + idx + " trop grosse (" + vol + " blocs)");
-                    for (int x = x0; x <= x1; x++) for (int y = y0; y <= y1; y++) for (int z = z0; z <= z1; z++) {
-                        boolean ex = x == x0 || x == x1, ey = y == y0 || y == y1, ez = z == z0 || z == z1;
-                        boolean ok = switch (mode) {
-                            case "solid" -> true;
-                            case "hollow" -> ex || ey || ez;
-                            case "walls" -> ex || ez;
-                            case "outline" -> (ex ? 1 : 0) + (ey ? 1 : 0) + (ez ? 1 : 0) >= 2;
-                            default -> throw new IllegalArgumentException("op " + idx + " : mode inconnu " + mode);
-                        };
-                        if (ok) out.put(new BlockPos(x, y, z).asLong(), st);
-                    }
-                }
-                default -> throw new IllegalArgumentException("op " + idx + " : type inconnu " + type);
+            } else {
+                // Grande boite creuse : on ne parcourt que sa surface.
+                Ops.rows(x0, y0, z0, x1, y1, z1, mode, x0, x1, y0, y1, z0, z1, (y, z, xa, xb) -> {
+                    for (int x = xa; x <= xb; x++) out.put(new BlockPos(x, y, z).asLong(), st);
+                });
             }
-            if (out.size() > MAX_BLOCKS) throw new IllegalArgumentException("build trop grand (> " + MAX_BLOCKS + " blocs)");
         }
         return out;
     }
 
-    private static int[] vec(JsonArray a, int idx) {
-        if (a == null || a.size() != 3) throw new IllegalArgumentException("op " + idx + " : coordonnees [x,y,z] attendues");
-        int[] v = new int[3];
-        for (int i = 0; i < 3; i++) {
-            v[i] = a.get(i).getAsInt();
-            if (Math.abs(v[i]) > MAX_COORD) throw new IllegalArgumentException("op " + idx + " : coordonnee hors limite (" + MAX_COORD + ")");
-        }
-        return v;
-    }
+    // ---------- placement progressif avec effets (mode classique) ----------
 
-    // ---------- placement progressif avec effets ----------
-
-    private static final class Job {
+    private static final class Job implements Task {
         final ServerLevel level;
         final UUID owner;
         final String name;
@@ -276,7 +395,11 @@ public final class Builds {
             this.level = level; this.owner = owner; this.name = name; this.list = list; this.undo = undo;
         }
 
-        boolean step() {
+        @Override public UUID owner() { return owner; }
+
+        @Override
+        public boolean step() {
+            if (list.isEmpty()) return true;
             int end = Math.min(list.size(), i + PER_TICK);
             ParticleOptions fx = undo ? ParticleTypes.SMOKE : ParticleTypes.END_ROD;
             for (int k = i; k < end; k++) {
