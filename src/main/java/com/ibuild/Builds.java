@@ -30,9 +30,9 @@ import java.util.*;
 
 public final class Builds {
     static final Path DIR = FabricLoader.getInstance().getGameDir().resolve("ibuilds");
-    static final int MAX_BLOCKS = 300_000;
-    static final int MAX_COORD = 512;
-    static final int PER_TICK = 200;
+    static final int MAX_BLOCKS = Integer.MAX_VALUE;
+    static final int MAX_COORD = 30_000;
+    static final int PER_TICK = 1000;
 
     private static final Map<String, JsonObject> FILES = new TreeMap<>();
     private static final List<String> ERRORS = new ArrayList<>();
