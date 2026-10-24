@@ -1,0 +1,6 @@
+{
+  "type": "minecraft:crafting_shapeless",
+  "category": "misc",
+  "ingredients": ["minecraft:stick", "minecraft:glowstone_dust", "minecraft:amethyst_shard"],
+  "result": { "id": "ibuild:builder_stick", "count": 1 }
+}

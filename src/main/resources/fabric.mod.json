@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "id": "ibuild",
+  "version": "${version}",
+  "name": "IA Builder Stick",
+  "description": "Un baton jaune qui place dans le monde les constructions generees par une IA (fichiers .json).",
+  "authors": [
+    "Aurelien"
+  ],
+  "license": "MIT",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.ibuild.IBuildMod"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.0",
+    "minecraft": "~26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  },
+  "icon": "assets/ibuild/icon.png"
+}

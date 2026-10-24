@@ -1,0 +1,20 @@
+{
+  "name": "petite_maison",
+  "ops": [
+    { "type": "fill", "from": [0,-1,0], "to": [8,-1,6], "block": "minecraft:stone_bricks", "mode": "solid" },
+    { "type": "fill", "from": [0,0,0],  "to": [8,3,6],  "block": "minecraft:oak_planks", "mode": "hollow" },
+    { "type": "fill", "from": [1,1,1],  "to": [7,3,5],  "block": "minecraft:air", "mode": "solid" },
+    { "type": "fill", "from": [0,0,0],  "to": [0,3,0],  "block": "minecraft:oak_log[axis=y]", "mode": "solid" },
+    { "type": "fill", "from": [8,0,0],  "to": [8,3,0],  "block": "minecraft:oak_log[axis=y]", "mode": "solid" },
+    { "type": "fill", "from": [0,0,6],  "to": [0,3,6],  "block": "minecraft:oak_log[axis=y]", "mode": "solid" },
+    { "type": "fill", "from": [8,0,6],  "to": [8,3,6],  "block": "minecraft:oak_log[axis=y]", "mode": "solid" },
+    { "type": "fill", "from": [2,2,6],  "to": [3,2,6],  "block": "minecraft:glass_pane", "mode": "solid" },
+    { "type": "fill", "from": [5,2,6],  "to": [6,2,6],  "block": "minecraft:glass_pane", "mode": "solid" },
+    { "type": "set",  "pos": [4,1,6], "block": "minecraft:oak_door[facing=south,half=lower,hinge=left,open=false]" },
+    { "type": "set",  "pos": [4,2,6], "block": "minecraft:oak_door[facing=south,half=upper,hinge=left,open=false]" },
+    { "type": "fill", "from": [-1,4,-1], "to": [9,4,7], "block": "minecraft:spruce_slab[type=bottom]", "mode": "solid" },
+    { "type": "set",  "pos": [4,1,2], "block": "minecraft:red_bed[facing=north,part=foot]" },
+    { "type": "set",  "pos": [4,1,1], "block": "minecraft:red_bed[facing=north,part=head]" },
+    { "type": "set",  "pos": [7,1,5], "block": "minecraft:lantern[hanging=false]" }
+  ]
+}
