@@ -6,8 +6,11 @@ import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
+import net.fabricmc.fabric.api.event.player.UseItemCallback;
 import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.screens.inventory.AbstractContainerScreen;
 import net.minecraft.client.multiplayer.ClientLevel;
 import net.minecraft.commands.SharedSuggestionProvider;
 import net.minecraft.core.BlockPos;
@@ -18,7 +21,7 @@ import net.minecraft.core.registries.Registries;
 import net.minecraft.network.chat.Component;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.InteractionResult;
-import net.minecraft.world.item.Items;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.Rotation;
@@ -39,7 +42,10 @@ import java.util.concurrent.CompletionException;
  * Le build (.json) est lu sur le PC du joueur et converti en commandes /fill et /setblock envoyees au serveur,
  * quelques-unes par tick. Il faut donc etre operateur (ou avoir les commandes) sur le serveur.
  *
- * Declencheur : clic droit sur un bloc avec un STICK VANILLA (sneak + clic = build suivant), ou /ibc place.
+ * Commandes : /ibuild ... (identiques au mode serveur). Elles ne s'activent que si le serveur n'a pas le mod ;
+ * sinon la commande est envoyee au serveur comme d'habitude.
+ * Stick : /ibuild stick met un "stick fantome" dans ta barre (visible seulement chez toi, le serveur voit un
+ * emplacement vide). Clic droit sur un bloc = place le build, sneak + clic = build suivant.
  */
 public final class IBuildClient implements ClientModInitializer {
     /** Undo disponible seulement si le build est assez petit pour garder l'etat precedent du monde. */
@@ -52,6 +58,8 @@ public final class IBuildClient implements ClientModInitializer {
     private static boolean planning;
     private static Job job;
     private static Job undoJob;
+    /** Slot de la barre (0-8) ou le stick fantome est affiche, -1 si desactive. */
+    private static int ghostSlot = -1;
 
     /** Liste de pavés : 7 int par pave (x0 y0 z0 x1 y1 z1 palette), coordonnees MONDE. */
     private static final class Job {
@@ -79,19 +87,31 @@ public final class IBuildClient implements ClientModInitializer {
     public void onInitializeClient() {
         ClientTickEvents.END_CLIENT_TICK.register(IBuildClient::tick);
 
+        // FAIL (et non SUCCESS) : le serveur ne recoit aucun paquet, donc pas d'ouverture de coffre/porte par erreur.
         UseBlockCallback.EVENT.register((player, level, hand, hit) -> {
-            if (!(level instanceof ClientLevel) || hand != InteractionHand.MAIN_HAND) return InteractionResult.PASS;
-            if (!player.getMainHandItem().is(Items.STICK)) return InteractionResult.PASS;
+            if (!(level instanceof ClientLevel) || hand != InteractionHand.MAIN_HAND || !clientMode()) return InteractionResult.PASS;
+            if (!isGhost(player.getMainHandItem())) return InteractionResult.PASS;
             if (player.isShiftKeyDown()) cycle();
             else place(hit.getBlockPos().relative(hit.getDirection()));
-            return InteractionResult.SUCCESS;
+            return InteractionResult.FAIL;
+        });
+
+        UseItemCallback.EVENT.register((player, level, hand) -> {
+            if (!(level instanceof ClientLevel) || hand != InteractionHand.MAIN_HAND || !clientMode()) return InteractionResult.PASS;
+            if (!isGhost(player.getMainHandItem())) return InteractionResult.PASS;
+            if (player.isShiftKeyDown()) cycle();
+            else { String n = selected(); bar(n == null ? "Aucun build dans " + Builds.DIR : "Build : " + n); }
+            return InteractionResult.FAIL;
         });
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> dispatcher.register(
-                ClientCommands.literal("ibc")
+                ClientCommands.literal("ibuild")
+                        .requires(src -> clientMode())
                         .executes(c -> { help(); return 1; })
                         .then(ClientCommands.literal("help").executes(c -> { help(); return 1; }))
                         .then(ClientCommands.literal("list").executes(c -> { list(); return 1; }))
+                        .then(ClientCommands.literal("reload").executes(c -> { msg(names().size() + " build(s) dans " + Builds.DIR); return 1; }))
+                        .then(ClientCommands.literal("stick").executes(c -> { toggleGhost(); return 1; }))
                         .then(ClientCommands.literal("place").executes(c -> { placeAtCrosshair(); return 1; }))
                         .then(ClientCommands.literal("undo").executes(c -> { undo(); return 1; }))
                         .then(ClientCommands.literal("stop").executes(c -> { stop(); return 1; }))
@@ -112,6 +132,61 @@ public final class IBuildClient implements ClientModInitializer {
                                 })))));
     }
 
+    // ---------- detection du mod cote serveur ----------
+
+    /** Vrai si ce serveur a le mod (solo / LAN, ou serveur qui a declare IBuildPresence). */
+    private static boolean serverHasMod() {
+        Minecraft mc = Minecraft.getInstance();
+        return mc.getSingleplayerServer() != null || ClientPlayNetworking.canSend(IBuildPresence.TYPE);
+    }
+
+    /** Le mode client n'est actif que connecte a un serveur SANS le mod. */
+    private static boolean clientMode() {
+        Minecraft mc = Minecraft.getInstance();
+        return mc.player != null && mc.level != null && mc.getConnection() != null && !serverHasMod();
+    }
+
+    // ---------- stick fantome : present seulement chez le client, le serveur voit un emplacement vide ----------
+
+    private static boolean isGhost(ItemStack st) {
+        return !st.isEmpty() && st.is(IBuildMod.BUILDER_STICK);
+    }
+
+    private static void toggleGhost() {
+        Minecraft mc = Minecraft.getInstance();
+        if (mc.player == null) return;
+        var inv = mc.player.getInventory();
+        if (ghostSlot >= 0) {
+            if (isGhost(inv.getItem(ghostSlot))) inv.setItem(ghostSlot, ItemStack.EMPTY);
+            ghostSlot = -1;
+            msg("Stick fantome retire.");
+            return;
+        }
+        for (int i = 0; i < 9; i++) {
+            if (inv.getItem(i).isEmpty()) {
+                ghostSlot = i;
+                inv.setItem(i, new ItemStack(IBuildMod.BUILDER_STICK));
+                msg("Stick place dans l'emplacement " + (i + 1) + " de ta barre (invisible pour le serveur).");
+                return;
+            }
+        }
+        msg("Libere un emplacement de ta barre d'objets d'abord.");
+    }
+
+    /** Chaque tick : remet le stick s'il a ete efface, le retire pendant les inventaires (il ne doit jamais partir dans un paquet). */
+    private static void tickGhost(Minecraft mc) {
+        if (ghostSlot < 0) return;
+        if (mc.player == null || !clientMode()) { ghostSlot = -1; return; }
+        var inv = mc.player.getInventory();
+        ItemStack cur = inv.getItem(ghostSlot);
+        if (mc.screen instanceof AbstractContainerScreen<?>) {
+            if (isGhost(cur)) inv.setItem(ghostSlot, ItemStack.EMPTY);
+            return;
+        }
+        if (cur.isEmpty()) inv.setItem(ghostSlot, new ItemStack(IBuildMod.BUILDER_STICK));
+        else if (!isGhost(cur)) { ghostSlot = -1; msg("Emplacement occupe : stick fantome desactive. Refais /ibuild stick."); }
+    }
+
     // ---------- messages ----------
 
     private static void msg(String s) {
@@ -126,8 +201,8 @@ public final class IBuildClient implements ClientModInitializer {
 
     private static void help() {
         msg("Mode client (serveur sans le mod) : il faut etre OP sur le serveur.");
-        msg("Clic droit sur un bloc avec un STICK vanilla = place le build. Sneak + clic = build suivant.");
-        msg("/ibc list | select <nom> | place | undo | stop | speed <1-50> | limit <taille>");
+        msg("/ibuild stick : stick fantome. Clic droit sur un bloc = place le build, sneak + clic = build suivant.");
+        msg("/ibuild list | reload | select <nom> | place | undo | stop | speed <1-50> | limit <taille>");
         msg("Dossier des builds : " + Builds.DIR);
     }
 
@@ -185,7 +260,7 @@ public final class IBuildClient implements ClientModInitializer {
     private static void place(BlockPos base) {
         Minecraft mc = Minecraft.getInstance();
         if (mc.player == null || mc.level == null || mc.getConnection() == null) return;
-        if (job != null || planning) { msg("Un build est deja en cours (/ibc stop pour l'arreter)."); return; }
+        if (job != null || planning) { msg("Un build est deja en cours (/ibuild stop pour l'arreter)."); return; }
         String name = selected();
         if (name == null) { msg("Aucun build. Mets tes .json dans : " + Builds.DIR); return; }
 
@@ -273,13 +348,14 @@ public final class IBuildClient implements ClientModInitializer {
         job = new Job(name, p.pc(), p.n(), p.pal());
         double secs = p.n() / (perTick * 20.0);
         msg("Construction de \"" + name + "\" : " + p.n() + " commandes (~" + Math.round(secs) + " s).");
-        if (undoJob == null) msg("Build trop gros pour /ibc undo (seul /ibc stop est possible).");
+        if (undoJob == null) msg("Build trop gros pour /ibuild undo (seul /ibuild stop est possible).");
         if (p.extent() > 160) msg("Attention : build large (" + p.extent() + " blocs). /fill echoue sur les zones non chargees par le serveur.");
     }
 
     // ---------- envoi des commandes ----------
 
     private static void tick(Minecraft mc) {
+        tickGhost(mc);
         Job j = job;
         if (j == null) return;
         if (mc.player == null || mc.getConnection() == null) { job = null; return; }
@@ -289,7 +365,7 @@ public final class IBuildClient implements ClientModInitializer {
             j.i = end;
             if (end >= j.n) {
                 job = null;
-                msg("\"" + j.name + "\" termine. (/ibc undo pour annuler)");
+                msg("\"" + j.name + "\" termine. (/ibuild undo pour annuler)");
             } else if (++j.ticks % 10 == 0) {
                 bar(j.name + " : " + (100L * end / j.n) + " %");
             }
@@ -312,7 +388,7 @@ public final class IBuildClient implements ClientModInitializer {
     private static void stop() {
         if (job == null) { msg("Aucun build en cours."); return; }
         job = null;
-        msg("Build arrete (les blocs deja places restent ; /ibc undo pour tout annuler).");
+        msg("Build arrete (les blocs deja places restent ; /ibuild undo pour tout annuler).");
     }
 
     private static void undo() {
@@ -335,71 +411,4 @@ public final class IBuildClient implements ClientModInitializer {
             int o = k * 7;
             int[] c = p.pc();
             for (int y = c[o + 1]; y <= c[o + 4]; y++) {
-                for (int z = c[o + 2]; z <= c[o + 5]; z++) {
-                    BlockState cur = null;
-                    int start = c[o];
-                    for (int x = c[o]; x <= c[o + 3]; x++) {
-                        BlockState st = level.getBlockState(mp.set(x, y, z));
-                        if (st.isAir()) st = Blocks.AIR.defaultBlockState(); // void_air / cave_air -> air
-                        if (cur == null) { cur = st; start = x; }
-                        else if (!st.equals(cur)) {
-                            if (!addRun(idx, pal, runs, cur, start, x - 1, y, z)) return null;
-                            cur = st; start = x;
-                        }
-                    }
-                    if (cur != null && !addRun(idx, pal, runs, cur, start, c[o + 3], y, z)) return null;
-                }
-            }
-        }
-        return new Job("undo", runs.trimmed(), runs.size / 7, pal.toArray(new String[0]));
-    }
-
-    private static boolean addRun(Map<BlockState, Integer> idx, List<String> pal, IntBuf runs,
-                                  BlockState st, int x0, int x1, int y, int z) {
-        Integer pi = idx.get(st);
-        if (pi == null) { pi = pal.size(); pal.add(ser(st)); idx.put(st, pi); }
-        runs.add7(x0, y, z, x1, y, z, pi);
-        return runs.size / 7 <= UNDO_MAX_RUNS;
-    }
-
-    // ---------- etat de bloc -> texte pour une commande ----------
-
-    private static String ser(BlockState s) {
-        Block b = s.getBlock();
-        BlockState def = b.defaultBlockState();
-        StringBuilder sb = new StringBuilder(String.valueOf(BuiltInRegistries.BLOCK.getKey(b)));
-        boolean first = true;
-        for (Property<?> p : s.getProperties()) {
-            String v = val(s, p);
-            if (v.equals(val(def, p))) continue; // on n'ecrit que ce qui differe de l'etat par defaut
-            sb.append(first ? '[' : ',').append(p.getName()).append('=').append(v);
-            first = false;
-        }
-        if (!first) sb.append(']');
-        return sb.toString();
-    }
-
-    private static <T extends Comparable<T>> String val(BlockState s, Property<T> p) {
-        return p.getName(s.getValue(p));
-    }
-
-    // ---------- hauteur du monde (meme technique que le mode serveur) ----------
-
-    private static int minY(ClientLevel l) {
-        int lo = -(1 << 16), hi = 0;
-        while (hi - lo > 1) {
-            int mid = (lo + hi) >> 1;
-            if (l.isOutsideBuildHeight(new BlockPos(0, mid, 0))) lo = mid; else hi = mid;
-        }
-        return hi;
-    }
-
-    private static int maxY(ClientLevel l) {
-        int lo = 0, hi = 1 << 16;
-        while (hi - lo > 1) {
-            int mid = (lo + hi) >> 1;
-            if (l.isOutsideBuildHeight(new BlockPos(0, mid, 0))) hi = mid; else lo = mid;
-        }
-        return lo;
-    }
-}
+                for 
