@@ -3,7 +3,7 @@ package com.ibuild;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+import net.fabricmc.fabric.api.client.command.v2.ClientCommands;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.event.player.UseBlockCallback;
@@ -88,23 +88,23 @@ public final class IBuildClient implements ClientModInitializer {
         });
 
         ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) -> dispatcher.register(
-                ClientCommandManager.literal("ibc")
+                ClientCommands.literal("ibc")
                         .executes(c -> { help(); return 1; })
-                        .then(ClientCommandManager.literal("help").executes(c -> { help(); return 1; }))
-                        .then(ClientCommandManager.literal("list").executes(c -> { list(); return 1; }))
-                        .then(ClientCommandManager.literal("place").executes(c -> { placeAtCrosshair(); return 1; }))
-                        .then(ClientCommandManager.literal("undo").executes(c -> { undo(); return 1; }))
-                        .then(ClientCommandManager.literal("stop").executes(c -> { stop(); return 1; }))
-                        .then(ClientCommandManager.literal("select").then(ClientCommandManager.argument("name", StringArgumentType.greedyString())
+                        .then(ClientCommands.literal("help").executes(c -> { help(); return 1; }))
+                        .then(ClientCommands.literal("list").executes(c -> { list(); return 1; }))
+                        .then(ClientCommands.literal("place").executes(c -> { placeAtCrosshair(); return 1; }))
+                        .then(ClientCommands.literal("undo").executes(c -> { undo(); return 1; }))
+                        .then(ClientCommands.literal("stop").executes(c -> { stop(); return 1; }))
+                        .then(ClientCommands.literal("select").then(ClientCommands.argument("name", StringArgumentType.greedyString())
                                 .suggests((ctx, b) -> SharedSuggestionProvider.suggest(names(), b))
                                 .executes(c -> { select(StringArgumentType.getString(c, "name")); return 1; })))
-                        .then(ClientCommandManager.literal("speed").then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 50))
+                        .then(ClientCommands.literal("speed").then(ClientCommands.argument("n", IntegerArgumentType.integer(1, 50))
                                 .executes(c -> {
                                     perTick = IntegerArgumentType.getInteger(c, "n");
                                     msg("Vitesse : " + perTick + " commande(s) par tick.");
                                     return 1;
                                 })))
-                        .then(ClientCommandManager.literal("limit").then(ClientCommandManager.argument("n", IntegerArgumentType.integer(1, 2_000_000))
+                        .then(ClientCommands.literal("limit").then(ClientCommands.argument("n", IntegerArgumentType.integer(1, 2_000_000))
                                 .executes(c -> {
                                     fillLimit = IntegerArgumentType.getInteger(c, "n");
                                     msg("Taille max d'un /fill : " + fillLimit + " blocs.");
@@ -116,12 +116,12 @@ public final class IBuildClient implements ClientModInitializer {
 
     private static void msg(String s) {
         Minecraft mc = Minecraft.getInstance();
-        if (mc.player != null) mc.player.displayClientMessage(Component.literal("[ibuild] " + s), false);
+        if (mc.player != null) mc.player.sendSystemMessage(Component.literal("[ibuild] " + s));
     }
 
     private static void bar(String s) {
         Minecraft mc = Minecraft.getInstance();
-        if (mc.player != null) mc.player.displayClientMessage(Component.literal(s), true);
+        if (mc.player != null) mc.gui.hud.setOverlayMessage(Component.literal(s), false);
     }
 
     private static void help() {
