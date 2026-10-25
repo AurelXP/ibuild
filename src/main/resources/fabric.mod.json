@@ -3,7 +3,7 @@
   "id": "ibuild",
   "version": "${version}",
   "name": "IA Builder Stick",
-  "description": "Un baton jaune qui place dans le monde les constructions generees par une IA (fichiers .json).",
+  "description": "Un baton jaune qui place dans le monde les constructions generees par une IA (fichiers .json). Fonctionne aussi sur un serveur sans le mod (mode client, via /fill et /setblock).",
   "authors": [
     "Aurelien"
   ],
@@ -12,6 +12,9 @@
   "entrypoints": {
     "main": [
       "com.ibuild.IBuildMod"
+    ],
+    "client": [
+      "com.ibuild.IBuildClient"
     ]
   },
   "depends": {
