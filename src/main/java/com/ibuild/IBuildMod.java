@@ -3,6 +3,8 @@ package com.ibuild;
 import com.mojang.brigadier.arguments.StringArgumentType;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
+import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
 import net.minecraft.commands.Commands;
 import net.minecraft.commands.SharedSuggestionProvider;
 import net.minecraft.core.Registry;
@@ -22,6 +24,10 @@ public class IBuildMod implements ModInitializer {
 
     @Override
     public void onInitialize() {
+        // Permet au client de savoir que ce serveur a le mod (voir IBuildPresence).
+        PayloadTypeRegistry.serverboundPlay().register(IBuildPresence.TYPE, IBuildPresence.CODEC);
+        ServerPlayNetworking.registerGlobalReceiver(IBuildPresence.TYPE, (payload, context) -> {});
+
         ResourceKey<Item> key = ResourceKey.create(Registries.ITEM, Identifier.fromNamespaceAndPath(MOD_ID, "builder_stick"));
         BUILDER_STICK = Registry.register(BuiltInRegistries.ITEM, key,
                 new BuilderStickItem(new Item.Properties()
