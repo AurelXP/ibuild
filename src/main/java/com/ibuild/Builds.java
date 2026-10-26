@@ -303,6 +303,11 @@ public final class Builds {
 
     static void undo(ServerPlayer p) {
         UUID id = p.getUUID();
+        if (PENDING.contains(id)) {
+            // Le build est encore en preparation (thread annexe) : rien n'est enregistre pour l'undo pour l'instant.
+            p.sendSystemMessage(IBuildMod.txt("[ibuild] Preparation du build en cours, reessaie /ibuild undo dans un instant."));
+            return;
+        }
         BigBuild.Undo big = BIG_UNDO.remove(id);
         List<Entry> u = UNDO.remove(id);
         if (big == null && u == null) { p.sendSystemMessage(IBuildMod.txt("[ibuild] Rien a annuler.")); return; }

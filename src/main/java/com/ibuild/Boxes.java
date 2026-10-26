@@ -44,6 +44,17 @@ final class Boxes {
         }
     }
 
+    /** Coupe un pave aux frontieres de chunks (multiples de 16 en x et z) : chaque morceau tient dans UNE colonne de chunk. */
+    static void splitChunks(int x0, int y0, int z0, int x1, int y1, int z1, Sink s) {
+        for (int cz = Math.floorDiv(z0, 16); cz <= Math.floorDiv(z1, 16); cz++) {
+            int za = Math.max(z0, cz * 16), zb = Math.min(z1, cz * 16 + 15);
+            for (int cx = Math.floorDiv(x0, 16); cx <= Math.floorDiv(x1, 16); cx++) {
+                int xa = Math.max(x0, cx * 16), xb = Math.min(x1, cx * 16 + 15);
+                s.box(xa, y0, za, xb, y1, zb);
+            }
+        }
+    }
+
     /** Decoupe un pave en morceaux de volume <= limit (coupe toujours le plus long cote en deux). */
     static void split(int x0, int y0, int z0, int x1, int y1, int z1, long limit, Sink s) {
         long dx = (long) x1 - x0 + 1, dy = (long) y1 - y0 + 1, dz = (long) z1 - z0 + 1;
